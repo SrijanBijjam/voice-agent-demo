@@ -13,65 +13,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-PORT = int(os.getenv("PORT", 3000))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PORT = int(os.getenv("PORT", 3001))
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
 
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY must be set in .env file")
+if not ELEVENLABS_API_KEY:
+    raise ValueError("ELEVENLABS_API_KEY must be set in .env file")
+if not ELEVENLABS_AGENT_ID:
+    raise ValueError("ELEVENLABS_AGENT_ID must be set in .env file")
 
 
-async def connect_to_openai():
-    """Connect to OpenAI's WebSocket endpoint."""
-    uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+async def connect_to_elevenlabs():
+    """Connect to ElevenLabs Conversational AI WebSocket."""
+    uri = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={ELEVENLABS_AGENT_ID}"
 
     try:
         ws = await connect(
             uri,
             extra_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-                "OpenAI-Beta": "realtime=v1",
+                "xi-api-key": ELEVENLABS_API_KEY,
             },
-            subprotocols=["realtime"],
         )
-        logger.info("Successfully connected to OpenAI")
-
-        response = await ws.recv()
-        try:
-            event = json.loads(response)
-            if event.get("type") != "session.created":
-                raise Exception(f"Expected session.created, got {event.get('type')}")
-            logger.info("Received session.created response")
-
-            update_session = {
-                "type": "session.update",
-                "session": {
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "modalities": ["text", "audio"],
-                    "voice": "alloy",
-                },
-            }
-            await ws.send(json.dumps(update_session))
-            logger.info("Sent session.create message")
-
-            return (
-                ws,
-                event,
-            )
-        except json.JSONDecodeError:
-            raise Exception(f"Invalid JSON response from OpenAI: {response}")
-
+        logger.info("Successfully connected to ElevenLabs Conversational AI")
+        return ws
     except Exception as e:
-        logger.error(f"Failed to connect to OpenAI: {str(e)}")
+        logger.error(f"Failed to connect to ElevenLabs: {str(e)}")
         raise
 
 
-class WebSocketRelay:
+class ElevenLabsRelay:
     def __init__(self):
         """Initialize the WebSocket relay server."""
         self.connections = {}
-        self.message_queues = {}
 
     async def handle_browser_connection(
         self, websocket: WebSocketServerProtocol, path: str
@@ -84,80 +57,168 @@ class WebSocketRelay:
             return
 
         logger.info(f"Browser connected from {websocket.remote_address}")
-        self.message_queues[websocket] = []
-        openai_ws = None
+        elevenlabs_ws = None
 
         try:
-            # Connect to OpenAI
-            openai_ws, session_created = await connect_to_openai()
-            self.connections[websocket] = openai_ws
+            # Connect to ElevenLabs Conversational AI
+            elevenlabs_ws = await connect_to_elevenlabs()
+            self.connections[websocket] = elevenlabs_ws
 
-            logger.info("Connected to OpenAI successfully!")
+            logger.info("Connected to ElevenLabs successfully!")
 
+            # Send a session created event to maintain compatibility with frontend
+            session_created = {
+                "type": "session.created",
+                "session": {
+                    "id": "elevenlabs_session",
+                    "object": "realtime.session",
+                    "model": "elevenlabs-conversational-ai",
+                    "modalities": ["text", "audio"],
+                    "instructions": "ElevenLabs Conversational AI Agent",
+                    "voice": "elevenlabs-agent-voice",
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "input_audio_transcription": None,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 200
+                    },
+                    "tools": [],
+                    "tool_choice": "auto",
+                    "temperature": 0.8,
+                    "max_response_output_tokens": "inf"
+                }
+            }
             await websocket.send(json.dumps(session_created))
-            logger.info("Forwarded session.created to browser")
-
-            while self.message_queues[websocket]:
-                message = self.message_queues[websocket].pop(0)
-                try:
-                    event = json.loads(message)
-                    logger.info(f'Relaying "{event.get("type")}" to OpenAI')
-                    await openai_ws.send(message)
-                except json.JSONDecodeError:
-                    logger.error(f"Invalid JSON from browser: {message}")
+            logger.info("Sent session.created to browser")
 
             async def handle_browser_messages():
+                """Forward browser messages to ElevenLabs."""
                 try:
                     while True:
                         message = await websocket.recv()
                         try:
                             event = json.loads(message)
-                            logger.info(f'Relaying "{event.get("type")}" to OpenAI')
-                            await openai_ws.send(message)
+                            event_type = event.get("type")
+                            
+                            # Handle different message types
+                            if event_type == "session.update":
+                                # ElevenLabs doesn't need session updates, send acknowledgment
+                                logger.info("Received session.update, acknowledging")
+                                ack_event = {
+                                    "type": "session.updated",
+                                    "session": session_created["session"]
+                                }
+                                await websocket.send(json.dumps(ack_event))
+                            elif event_type == "input_audio_buffer.append":
+                                # Forward audio data to ElevenLabs
+                                logger.info("Forwarding audio input to ElevenLabs")
+                                # Convert OpenAI format to ElevenLabs format if needed
+                                elevenlabs_message = {
+                                    "user_audio_chunk": event.get("audio", "")
+                                }
+                                await elevenlabs_ws.send(json.dumps(elevenlabs_message))
+                            elif event_type == "input_audio_buffer.commit":
+                                # Signal end of audio input
+                                logger.info("Committing audio buffer")
+                                # ElevenLabs handles this automatically
+                                pass
+                            elif event_type == "response.create":
+                                # Trigger response generation
+                                logger.info("Creating response")
+                                # ElevenLabs handles this automatically with VAD
+                                pass
+                            else:
+                                # Forward other events directly or log them
+                                logger.info(f'Received event "{event_type}" from browser')
+                                
                         except json.JSONDecodeError:
                             logger.error(f"Invalid JSON from browser: {message}")
+                        except Exception as e:
+                            logger.error(f"Error processing browser message: {e}")
+                            
                 except websockets.exceptions.ConnectionClosed as e:
-                    logger.info(
-                        f"Browser connection closed normally: code={e.code}, reason={e.reason}"
-                    )
+                    logger.info(f"Browser connection closed: code={e.code}, reason={e.reason}")
                     raise
 
-            async def handle_openai_messages():
+            async def handle_elevenlabs_messages():
+                """Forward ElevenLabs messages to browser."""
                 try:
                     while True:
-                        message = await openai_ws.recv()
+                        message = await elevenlabs_ws.recv()
                         try:
                             event = json.loads(message)
-                            logger.info(
-                                f'Relaying "{event.get("type")}" from OpenAI: {message}'
-                            )
+                            event_type = event.get("type")
+                            
+                            # Convert ElevenLabs events to OpenAI-compatible format
+                            if event_type == "audio":
+                                # Convert ElevenLabs audio to OpenAI format
+                                openai_event = {
+                                    "type": "response.audio.delta",
+                                    "response_id": "elevenlabs_response",
+                                    "item_id": "elevenlabs_audio",
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": event.get("audio_event", {}).get("audio_base_64", "")
+                                }
+                                await websocket.send(json.dumps(openai_event))
+                                logger.info("Relayed audio from ElevenLabs")
+                            elif event_type == "message":
+                                # Handle text messages
+                                message_content = event.get("message", {})
+                                if message_content.get("role") == "assistant":
+                                    openai_event = {
+                                        "type": "response.text.delta",
+                                        "response_id": "elevenlabs_response", 
+                                        "item_id": "elevenlabs_text",
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": message_content.get("content", "")
+                                    }
+                                    await websocket.send(json.dumps(openai_event))
+                                    logger.info("Relayed text from ElevenLabs")
+                            elif event_type == "interruption":
+                                # Handle interruptions
+                                openai_event = {
+                                    "type": "conversation.interrupted"
+                                }
+                                await websocket.send(json.dumps(openai_event))
+                                logger.info("Relayed interruption from ElevenLabs")
+                            else:
+                                # Forward other events or log them
+                                logger.info(f'Received event "{event_type}" from ElevenLabs: {message}')
+                                # For compatibility, forward as-is
                             await websocket.send(message)
+                                
                         except json.JSONDecodeError:
-                            logger.error(f"Invalid JSON from OpenAI: {message}")
+                            logger.error(f"Invalid JSON from ElevenLabs: {message}")
+                        except Exception as e:
+                            logger.error(f"Error processing ElevenLabs message: {e}")
+                            
                 except websockets.exceptions.ConnectionClosed as e:
-                    logger.info(
-                        f"OpenAI connection closed normally: code={e.code}, reason={e.reason}"
-                    )
+                    logger.info(f"ElevenLabs connection closed: code={e.code}, reason={e.reason}")
                     raise
 
             try:
                 await asyncio.gather(
-                    handle_browser_messages(), handle_openai_messages()
+                    handle_browser_messages(),
+                    handle_elevenlabs_messages()
                 )
             except websockets.exceptions.ConnectionClosed:
-                logger.info("One of the connections closed, cleaning up")
+                logger.info("Connection closed, cleaning up")
 
         except Exception as e:
             logger.error(f"Error handling connection: {str(e)}")
             if not websocket.closed:
                 await websocket.close(1011, str(e))
         finally:
+            # Cleanup
             if websocket in self.connections:
-                if openai_ws and not openai_ws.closed:
-                    await openai_ws.close(1000, "Normal closure")
+                if elevenlabs_ws and not elevenlabs_ws.closed:
+                    await elevenlabs_ws.close(1000, "Normal closure")
                 del self.connections[websocket]
-            if websocket in self.message_queues:
-                del self.message_queues[websocket]
             if not websocket.closed:
                 await websocket.close(1000, "Normal closure")
 
@@ -171,13 +232,13 @@ class WebSocketRelay:
             ping_timeout=20,
             subprotocols=["realtime"],
         ):
-            logger.info(f"WebSocket relay server started on ws://0.0.0.0:{PORT}")
+            logger.info(f"ElevenLabs relay server started on ws://0.0.0.0:{PORT}")
             await asyncio.Future()
 
 
 def main():
     """Main entry point for the WebSocket relay server."""
-    relay = WebSocketRelay()
+    relay = ElevenLabsRelay()
     try:
         asyncio.run(relay.serve())
     except KeyboardInterrupt:

@@ -1,171 +1,152 @@
-import { useState, useEffect, useRef, useCallback } from "react";
-import { RealtimeClient } from "@openai/realtime-api-beta";
-// @ts-expect-error - External library without type definitions
-import { WavRecorder, WavStreamPlayer } from "./lib/wavtools/index.js";
-import { instructions } from "./conversation_config.js";
+import { useState, useEffect } from 'react';
+import { useConversation } from '@elevenlabs/react';
 import "./App.css";
 
-const clientRef = { current: null as RealtimeClient | null };
-const wavRecorderRef = { current: null as WavRecorder | null };
-const wavStreamPlayerRef = { current: null as WavStreamPlayer | null };
+const AGENT_ID = 'agent_01jwbhyj35e5qs60j18gps81vq';
 
-export function App() {
-  const params = new URLSearchParams(window.location.search);
-  const RELAY_SERVER_URL = params.get("wss");
-  const [connectionStatus, setConnectionStatus] = useState<
-    "disconnected" | "connecting" | "connected"
-  >("disconnected");
+function base64ToBlob(base64Data: string, contentType = 'audio/mpeg') {
+  const byteCharacters = atob(base64Data);
+  const byteNumbers = new Array(byteCharacters.length);
+  for (let i = 0; i < byteCharacters.length; i++) {
+    byteNumbers[i] = byteCharacters.charCodeAt(i);
+  }
+  const byteArray = new Uint8Array(byteNumbers);
+  return new Blob([byteArray], { type: contentType });
+}
 
-  if (!clientRef.current) {
-    clientRef.current = new RealtimeClient({
-      url: RELAY_SERVER_URL || undefined,
-    });
-  }
-  if (!wavRecorderRef.current) {
-    wavRecorderRef.current = new WavRecorder({ sampleRate: 24000 });
-  }
-  if (!wavStreamPlayerRef.current) {
-    wavStreamPlayerRef.current = new WavStreamPlayer({ sampleRate: 24000 });
-  }
-  const isConnectedRef = useRef(false);
-  const connectConversation = useCallback(async () => {
-    if (isConnectedRef.current) return;
-    isConnectedRef.current = true;
-    setConnectionStatus("connecting");
-    const client = clientRef.current;
-    const wavRecorder = wavRecorderRef.current;
-    const wavStreamPlayer = wavStreamPlayerRef.current;
-    if (!client || !wavRecorder || !wavStreamPlayer) return;
+interface Message {
+  id: number;
+  timestamp: string;
+  type?: string;
+  agent_response?: string;
+  user_transcript?: string;
+  message?: string;
+  audio_base_64?: string;
+}
+
+export default function App() {
+  const [error, setError] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+
+  const conversation = useConversation({
+    onConnect: () => {
+      console.log('✅ Connected to ElevenLabs WebSocket');
+      setError(null);
+    },
+    onDisconnect: (event: any) => {
+      console.log('❌ Disconnected from WebSocket:', event);
+    },
+    onMessage: (message: any) => {
+      console.log('📨 Message received:', message);
+      setMessages(prev => [...prev, {
+        id: Date.now(),
+        timestamp: new Date().toLocaleTimeString(),
+        ...message
+      }]);
+
+      if (message.type === 'audio' && message.audio_base_64) {
+        try {
+          const audioBlob = base64ToBlob(message.audio_base_64);
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          audio.play().then(() => {
+            URL.revokeObjectURL(audioUrl);
+          }).catch(console.error);
+        } catch (err) {
+          console.error('Failed to process audio:', err);
+        }
+      }
+    },
+    onEnd: (reason: any) => {
+      console.warn('🛑 Conversation ended. Reason:', reason);
+    },
+    onError: (err: any) => {
+      console.error('❗ Conversation error:', err);
+      setError(`Conversation error: ${err.message || err}`);
+    },
+    debug: true,
+  });
+
+  const { status, isSpeaking } = conversation;
+
+  const requestMicAccess = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return stream;
+    } catch (e) {
+      setError('Microphone access is required');
+      return null;
+    }
+  };
+
+  const startConversation = async () => {
+    setError(null);
+    setMessages([]);
+
+    const stream = await requestMicAccess();
+    if (!stream) return;
 
     try {
-      // Connect to microphone
-      await wavRecorder.begin();
-
-      // Connect to audio output
-      await wavStreamPlayer.connect();
-
-      // Connect to realtime API
-      await client.connect();
-
-      setConnectionStatus("connected");
-
-      client.on("error", (event: any) => {
-        console.error(event);
-        setConnectionStatus("disconnected");
+      const convId = await conversation.startSession({
+        agentId: AGENT_ID
       });
 
-      client.on("disconnected", () => {
-        setConnectionStatus("disconnected");
-      });
+      console.log('🎤 Conversation started with ID:', convId);
 
-      client.sendUserMessageContent([
-        {
-          type: `input_text`,
-          text: `Hello!`,
-        },
-      ]);
-
-      // Always use VAD mode
-      client.updateSession({
-        turn_detection: { type: "server_vad" },
-      });
-
-      // Check if we're already recording before trying to pause
-      if (wavRecorder.recording) {
-        await wavRecorder.pause();
-      }
-
-      // Check if we're already paused before trying to record
-      if (!wavRecorder.recording) {
-        await wavRecorder.record((data: { mono: Float32Array }) =>
-          client.appendInputAudio(data.mono)
-        );
-      }
-    } catch (error) {
-      console.error("Connection error:", error);
-      setConnectionStatus("disconnected");
+    } catch (e: any) {
+      setError(`Unable to start conversation: ${e.message || e}`);
     }
-  }, []);
+  };
 
-  const errorMessage = !RELAY_SERVER_URL
-    ? 'Missing required "wss" parameter in URL'
-    : (() => {
-        try {
-          new URL(RELAY_SERVER_URL);
-          return null;
-        } catch {
-          return 'Invalid URL format for "wss" parameter';
-        }
-      })();
+  const stopConversation = async () => {
+    try {
+      await conversation.endSession();
+    } catch (e: any) {
+      setError(`Unable to stop conversation: ${e.message || e}`);
+    }
+  };
 
-  /**
-   * Core RealtimeClient and audio capture setup
-   * Set all of our instructions, tools, events and more
-   */
   useEffect(() => {
-    // Only run the effect if there's no error
-    if (!errorMessage) {
-      connectConversation();
-      const wavStreamPlayer = wavStreamPlayerRef.current;
-      const client = clientRef.current;
-      if (!client || !wavStreamPlayer) return;
-
-      // Set instructions
-      client.updateSession({ instructions: instructions });
-
-      // handle realtime events from client + server for event logging
-      client.on("error", (event: any) => console.error(event));
-      client.on("conversation.interrupted", async () => {
-        const trackSampleOffset = await wavStreamPlayer.interrupt();
-        if (trackSampleOffset?.trackId) {
-          const { trackId, offset } = trackSampleOffset;
-          await client.cancelResponse(trackId, offset);
-        }
-      });
-      client.on("conversation.updated", async ({ item, delta }: any) => {
-        client.conversation.getItems();
-        if (delta?.audio) {
-          wavStreamPlayer.add16BitPCM(delta.audio, item.id);
-        }
-        if (item.status === "completed" && item.formatted.audio?.length) {
-          const wavFile = await WavRecorder.decode(
-            item.formatted.audio,
-            24000,
-            24000
-          );
-          item.formatted.file = wavFile;
-        }
-      });
-
-      return () => {
-        client.reset();
-      };
-    }
-  }, [errorMessage]);
+    // Auto-start conversation when component mounts
+    startConversation();
+    
+    return () => {
+      if (status === 'connected') {
+        conversation.endSession().catch(() => {});
+      }
+    };
+  }, []); // Empty dependency array means this runs once on mount
 
   return (
     <div className="app-container">
-      <div className="status-indicator">
-        <div
-          className={`status-dot ${
-            errorMessage ? "disconnected" : connectionStatus
-          }`}
-        />
-        <div className="status-text">
-          <div className="status-label">
-            {errorMessage
-              ? "Error:"
-              : connectionStatus === "connecting"
-              ? "Connecting to:"
-              : connectionStatus === "connected"
-              ? "Connected to:"
-              : "Failed to connect to:"}
-          </div>
-          <div className="status-url">{errorMessage || RELAY_SERVER_URL}</div>
+      <div className="voice-agent-container">
+        <h2>🧠 ElevenLabs Voice Assistant</h2>
+        <div className="status-display">
+          <p>Status: <strong>{status}</strong> | Speaking: <strong>{isSpeaking ? 'Yes' : 'No'}</strong></p>
+        </div>
+
+        {error && <p className="error-message">⚠️ {error}</p>}
+
+        {status === 'connected' && (
+          <button 
+            className="conversation-btn stop"
+            onClick={stopConversation}
+          >
+            🛑 Stop Speaking
+          </button>
+        )}
+
+        <div className="conversation-log">
+          <h3>Conversation Log</h3>
+          <ul className="message-list">
+            {messages.map(msg => (
+              <li key={msg.id} className="message-item">
+                <strong>{msg.timestamp}</strong>: {msg.agent_response || msg.user_transcript || msg.message || msg.type}
+              </li>
+            ))}
+          </ul>
         </div>
       </div>
     </div>
   );
 }
-
-export default App;
